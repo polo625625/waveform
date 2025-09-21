@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>10 秒錄音＋即時波形與主頻分析</title>
+<style>
+  :root { --gap: 10px; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto; padding: 16px; }
+  h2 { margin: 0 0 12px 0; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: var(--gap); margin-bottom: 12px; }
+  button { padding: 10px 14px; border: 1px solid #ccc; border-radius: 10px; cursor: pointer; background: #fafafa; }
+  button:disabled { opacity: .6; cursor: not-allowed; }
+  #status { margin-left: 6px; font-size: 14px; color: #555; }
+  .canvases { display: grid; gap: var(--gap); }
+  canvas { width: 100%; height: 180px; border: 1px solid #ddd; border-radius: 8px; background: #fff; }
+  .panel { display: grid; gap: 6px; }
+  .freqs { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre; padding: 10px; border: 1px solid #eee; border-radius: 8px; background: #fcfcfc; }
+  .note { font-size: 12px; color:#666; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h2>聲音錄製與主頻分析</h2>
+
+  <div class="toolbar">
+    <button id="btnStart">🎤 錄音 10 秒</button>
+    <button id="btnPause" disabled>⏸ 暫停波形</button>
+    <button id="btnClear">🧹 清除</button>
+    <span id="status"></span>
+  </div>
+
+  <div class="canvases">
+    <div class="panel">
+      <label>即時波形（Time Domain）</label>
+      <canvas id="waveCanvas" width="900" height="220"></canvas>
+    </div>
+  </div>
+
+  <div class="panel">
+    <label>前三大主頻（即時）</label>
+    <div id="freqReadout" class="freqs">尚未開始</div>
+  </div>
+  <div class="note">提示：必須在 HTTPS 網站上使用，第一次錄音會跳出麥克風權限詢問。</div>
+
+<script>
+(()=> {
+  // --- 元件參考 ---
+  const btnStart = document.getElementById('btnStart');
+  const btnPause = document.getElementById('btnPause');
+  const btnClear = document.getElementById('btnClear');
+  const statusEl = document.getElementById('status');
+  const waveCanvas = document.getElementById('waveCanvas');
+  const wctx = waveCanvas.getContext('2d');
+  const freqReadout = document.getElementById('freqReadout');
+
+  // --- 狀態 ---
+  let audioCtx = null;
+  let analyser = null;
+  let mediaStream = null;
+  let mediaSource = null;
+  let rafId = null;
+  let drawFrozen = false;
+  let drawingStarted = false;
+  let freqTimer = null;
+  let mediaRecorder = null;
+  let recordTimer = null;
+
+  // 設定 FFT 尺寸（解析度）
+  const FFT_SIZE = 4096; // 解析度較好（≈ sampleRate/4096 Hz）
+  const FREQ_UPDATE_MS = 150; // 主頻更新頻率（毫秒）
+
+  function setStatus(msg) {
+    statusEl.textContent = msg || '';
+  }
+
+  function resetAll() {
+    // 停止動畫
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+
+    // 清頻率更新
+    if (freqTimer) clearInterval(freqTimer);
+    freqTimer = null;
+
+    // 停止錄音計時
+    if (recordTimer) clearTimeout(recordTimer);
+    recordTimer = null;
+
+    // 停止 MediaRecorder
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      try { mediaRecorder.stop(); } catch {}
+    }
+    mediaRecorder = null;
+
+    // 關閉音訊串流
+    if (mediaStream) {
+      mediaStream.getTracks().forEach(t => t.stop());
+      mediaStream = null;
+    }
+
+    // 關閉 AudioContext
+    if (audioCtx) {
+      try { audioCtx.close(); } catch {}
+      audioCtx = null;
+    }
+
+    analyser = null;
+    mediaSource = null;
+    drawingStarted = false;
+    drawFrozen = false;
+
+    // UI
+    btnPause.textContent = '⏸ 暫停波形';
+    btnPause.disabled = true;
+    setStatus('');
+  }
+
+  function clearScreen() {
+    // 清畫布與頻率欄
+    wctx.clearRect(0, 0, waveCanvas.width, waveCanvas.height);
+    freqReadout.textContent = '';
+  }
+
+  function drawWaveform() {
+    if (!analyser) return;
+
+    const buffer = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(buffer);
+
+    // 背景
+    wctx.fillStyle = '#ffffff';
+    wctx.fillRect(0, 0, waveCanvas.width, waveCanvas.height);
+
+    // 中心線
+    wctx.strokeStyle = '#e6e6e6';
+    wctx.lineWidth = 1;
+    wctx.beginPath();
+    wctx.moveTo(0, waveCanvas.height/2);
+    wctx.lineTo(waveCanvas.width, waveCanvas.height/2);
+    wctx.stroke();
+
+    // 波形
+    wctx.strokeStyle = '#000000';
+    wctx.lineWidth = 2;
+    wctx.beginPath();
+
+    const slice = waveCanvas.width / buffer.length;
+    let x = 0;
+    for (let i = 0; i < buffer.length; i++) {
+      const v = buffer[i] / 128.0; // 0..255 -> around 1.0 at center
+      const y = (v * waveCanvas.height/2);
+      if (i === 0) wctx.moveTo(x, y);
+      else wctx.lineTo(x, y);
+      x += slice;
+    }
+    wctx.stroke();
+
+    if (!drawFrozen) {
+      rafId = requestAnimationFrame(drawWaveform);
+    }
+  }
+
+  function smoothArray(arr, windowSize=3) {
+    const out = new Float32Array(arr.length);
+    const half = Math.floor(windowSize/2);
+    for (let i=0;i<arr.length;i++){
+      let sum = 0, cnt = 0;
+      for (let k = -half; k <= half; k++){
+        const idx = i + k;
+        if (idx >=0 && idx < arr.length) { sum += arr[idx]; cnt++; }
+      }
+      out[i] = sum / cnt;
+    }
+    return out;
+  }
+
+  function topFrequencies(analyser, sampleRate, topN = 3) {
+    const N = analyser.frequencyBinCount; // = FFT_SIZE/2
+    const freqData = new Uint8Array(N);
+    analyser.getByteFrequencyData(freqData);
+
+    // 轉 Float 並略做平滑，過濾雜訊
+    const floatArr = Float32Array.from(freqData, v => v);
+    const smoothed = smoothArray(floatArr, 5);
+
+    // 忽略 DC（0 Hz）與很高頻噪聲，可用範圍 20Hz ~ 8000Hz（語音常見主成分）
+    const minHz = 20;
+    const maxHz = Math.min(8000, sampleRate / 2);
+    const binHz = sampleRate / FFT_SIZE;
+
+    let candidates = [];
+    let totalAmp = 0;
+
+    for (let i = 0; i < N; i++) {
+      const hz = i * binHz;
+      const amp = Math.max(0, smoothed[i]);
+      if (hz >= minHz && hz <= maxHz) {
+        candidates.push({ i, hz, amp });
+        totalAmp += amp;
+      }
+    }
+
+    if (totalAmp <= 0) {
+      return { list: [], totalAmp: 0 };
+    }
+
+    // 找「局部峰值」
+    const peaks = [];
+    for (let k = 1; k < candidates.length - 1; k++) {
+      const a = candidates[k-1].amp, b = candidates[k].amp, c = candidates[k+1].amp;
+      if (b > a && b >= c) {
+        peaks.push(candidates[k]);
+      }
+    }
+
+    // 依強度排序
+    peaks.sort((p, q) => q.amp - p.amp);
+
+    // 合併彼此太接近的峰（避免同一主頻被多個相鄰 bin 吃到）
+    const merged = [];
+    const minSepHz = binHz * 3; // 至少間隔幾個 bin
+    peaks.forEach(p => {
+      if (!merged.some(m => Math.abs(m.hz - p.hz) < minSepHz)) merged.push(p);
+    });
+
+    // 取前 topN
+    const top = merged.slice(0, topN);
+
+    // 佔比（相對於總能量）
+    const list = top.map(item => ({
+      hz: item.hz,
+      ratio: (item.amp / totalAmp)
+    }));
+
+    return { list, totalAmp };
+  }
+
+  function updateFreqReadout() {
+    if (!analyser || !audioCtx) return;
+    const { list } = topFrequencies(analyser, audioCtx.sampleRate, 3);
+    if (!list.length) {
+      freqReadout.textContent = '（偵測中… 尚無顯著主頻）';
+      return;
+    }
+    const lines = list.map((f, idx) =>
+      `#${idx+1}  ${f.hz.toFixed(1).padStart(7)} Hz    佔比：${(f.ratio*100).toFixed(2)}%`
+    );
+    freqReadout.textContent = lines.join('\n');
+  }
+
+  async function startRecording10s() {
+    resetAll();
+    clearScreen();
+
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      setStatus('無法取得麥克風權限：' + err.message);
+      return;
+    }
+
+    // Audio Graph
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    mediaSource = audioCtx.createMediaStreamSource(mediaStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = FFT_SIZE;
+    analyser.smoothingTimeConstant = 0.85; // 稍微平滑
+
+    mediaSource.connect(analyser);
+
+    // 開始即時繪圖
+    drawFrozen = false;
+    drawingStarted = true;
+    rafId = requestAnimationFrame(drawWaveform);
+
+    // 即時主頻更新
+    updateFreqReadout();
+    freqTimer = setInterval(updateFreqReadout, FREQ_UPDATE_MS);
+
+    // MediaRecorder（如需實際保存錄音，可在 onstop 取得 blob）
+    if (window.MediaRecorder) {
+      mediaRecorder = new MediaRecorder(mediaStream);
+      const chunks = [];
+      mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+      mediaRecorder.onstop = () => {
+        // 你可選擇提供下載：
+        // const blob = new Blob(chunks, { type: 'audio/webm' });
+        // const url = URL.createObjectURL(blob);
+        // setStatus('已錄製 10 秒。'); // 或顯示下載連結
+      };
+      mediaRecorder.start();
+    }
+
+    // UI 狀態
+    btnPause.disabled = false;
+    btnPause.textContent = '⏸ 暫停波形';
+    setStatus('錄音中…（自動於 10 秒結束）');
+
+    // 10 秒後自動停止
+    recordTimer = setTimeout(() => {
+      // 停止圖與頻率更新，但保留最後一幀＝「凍結」
+      drawFrozen = true;
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = null;
+      if (freqTimer) clearInterval(freqTimer);
+      freqTimer = null;
+
+      // 停止錄音、關閉串流
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        try { mediaRecorder.stop(); } catch {}
+      }
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(t => t.stop());
+        mediaStream = null;
+      }
+      setStatus('已自動結束錄音（10 秒）。');
+    }, 10000);
+  }
+
+  // --- 事件繫結 ---
+  btnStart.addEventListener('click', startRecording10s);
+
+  btnPause.addEventListener('click', () => {
+    if (!drawingStarted) return;
+    drawFrozen = !drawFrozen;
+    if (!drawFrozen) {
+      btnPause.textContent = '⏸ 暫停波形';
+      rafId = requestAnimationFrame(drawWaveform);
+      if (!freqTimer) freqTimer = setInterval(updateFreqReadout, FREQ_UPDATE_MS);
+      setStatus('持續更新中…');
+    } else {
+      btnPause.textContent = '▶️ 繼續波形';
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = null;
+      if (freqTimer) clearInterval(freqTimer);
+      freqTimer = null;
+      setStatus('已凍結波形。');
+    }
+  });
+
+  btnClear.addEventListener('click', () => {
+    resetAll();
+    clearScreen();
+    setStatus('已清除畫面。');
+    freqReadout.textContent = '';
+  });
+})();
+</script>
+</body>
+</html>

@@ -3,20 +3,23 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>10 秒錄音＋即時波形與主頻分析</title>
+<title>10 秒錄音＋即時波形與主頻分析（振幅/高頻封包）</title>
 <style>
   :root { --gap: 10px; }
   body { font-family: system-ui, -apple-system, "Segoe UI", Roboto; padding: 16px; }
   h2 { margin: 0 0 12px 0; }
-  .toolbar { display: flex; flex-wrap: wrap; gap: var(--gap); margin-bottom: 12px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: var(--gap); margin-bottom: 12px; align-items: center; }
   button { padding: 10px 14px; border: 1px solid #ccc; border-radius: 10px; cursor: pointer; background: #fafafa; }
   button:disabled { opacity: .6; cursor: not-allowed; }
+  .controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+  .control { display: flex; align-items: center; gap: 8px; }
   #status { margin-left: 6px; font-size: 14px; color: #555; }
   .canvases { display: grid; gap: var(--gap); }
-  canvas { width: 100%; height: 180px; border: 1px solid #ddd; border-radius: 8px; background: #fff; }
+  canvas { width: 100%; height: 200px; border: 1px solid #ddd; border-radius: 8px; background: #fff; }
   .panel { display: grid; gap: 6px; }
   .freqs { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre; padding: 10px; border: 1px solid #eee; border-radius: 8px; background: #fcfcfc; }
   .note { font-size: 12px; color:#666; margin-top: 8px; }
+  label { user-select: none; }
 </style>
 </head>
 <body>
@@ -29,7 +32,18 @@
     <span id="status"></span>
   </div>
 
-  <div class="canvases">
+  <div class="controls">
+    <div class="control">
+      <label for="gain">振幅放大：</label>
+      <input id="gain" type="range" min="1" max="6" step="0.5" value="2">
+      <span id="gainVal">2.0×</span>
+    </div>
+    <div class="control">
+      <label><input id="hiFreqMode" type="checkbox"> 高頻模式（一次顯示 5 個封包）</label>
+    </div>
+  </div>
+
+  <div class="canvases" style="margin-top:10px;">
     <div class="panel">
       <label>即時波形（Time Domain）</label>
       <canvas id="waveCanvas" width="900" height="220"></canvas>
@@ -40,11 +54,11 @@
     <label>前三大主頻（即時）</label>
     <div id="freqReadout" class="freqs">尚未開始</div>
   </div>
-  <div class="note">提示：必須在 HTTPS 網站上使用，第一次錄音會跳出麥克風權限詢問。</div>
+  <div class="note">提示：請在 HTTPS 的頂層頁面開啟（Google Sites 請用「按鈕→新視窗開啟」）。首次使用會跳出麥克風授權。</div>
 
 <script>
 (()=> {
-  // --- 元件參考 ---
+  // --- UI 參考 ---
   const btnStart = document.getElementById('btnStart');
   const btnPause = document.getElementById('btnPause');
   const btnClear = document.getElementById('btnClear');
@@ -52,6 +66,9 @@
   const waveCanvas = document.getElementById('waveCanvas');
   const wctx = waveCanvas.getContext('2d');
   const freqReadout = document.getElementById('freqReadout');
+  const gainSlider = document.getElementById('gain');
+  const gainVal = document.getElementById('gainVal');
+  const hiFreqMode = document.getElementById('hiFreqMode');
 
   // --- 狀態 ---
   let audioCtx = null;
@@ -64,59 +81,45 @@
   let freqTimer = null;
   let mediaRecorder = null;
   let recordTimer = null;
+  let ampGain = parseFloat(gainSlider.value);
 
-  // 設定 FFT 尺寸（解析度）
-  const FFT_SIZE = 4096; // 解析度較好（≈ sampleRate/4096 Hz）
-  const FREQ_UPDATE_MS = 150; // 主頻更新頻率（毫秒）
+  // FFT / 封包設定
+  const FFT_SIZE = 4096;                 // 時域取樣點數 (= 畫波形的可用樣本數)
+  const FREQ_UPDATE_MS = 150;            // 主頻更新間隔
+  const PACKETS_TO_SHOW = 5;             // 高頻模式：一次顯示 5 個封包
+  const SAMPLES_PER_PACKET = 256;        // 每個封包 256 樣本（總 1280 樣本）
+  const DRAW_BG = '#ffffff';
 
-  function setStatus(msg) {
-    statusEl.textContent = msg || '';
-  }
+  function setStatus(msg) { statusEl.textContent = msg || ''; }
 
   function resetAll() {
-    // 停止動畫
-    if (rafId) cancelAnimationFrame(rafId);
-    rafId = null;
+    if (rafId) cancelAnimationFrame(rafId); rafId = null;
+    if (freqTimer) clearInterval(freqTimer); freqTimer = null;
+    if (recordTimer) clearTimeout(recordTimer); recordTimer = null;
 
-    // 清頻率更新
-    if (freqTimer) clearInterval(freqTimer);
-    freqTimer = null;
-
-    // 停止錄音計時
-    if (recordTimer) clearTimeout(recordTimer);
-    recordTimer = null;
-
-    // 停止 MediaRecorder
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {
       try { mediaRecorder.stop(); } catch {}
     }
     mediaRecorder = null;
 
-    // 關閉音訊串流
     if (mediaStream) {
       mediaStream.getTracks().forEach(t => t.stop());
       mediaStream = null;
     }
 
-    // 關閉 AudioContext
-    if (audioCtx) {
-      try { audioCtx.close(); } catch {}
-      audioCtx = null;
-    }
+    if (audioCtx) { try { audioCtx.close(); } catch {} audioCtx = null; }
 
     analyser = null;
     mediaSource = null;
     drawingStarted = false;
     drawFrozen = false;
 
-    // UI
     btnPause.textContent = '⏸ 暫停波形';
     btnPause.disabled = true;
     setStatus('');
   }
 
   function clearScreen() {
-    // 清畫布與頻率欄
     wctx.clearRect(0, 0, waveCanvas.width, waveCanvas.height);
     freqReadout.textContent = '';
   }
@@ -127,11 +130,16 @@
     const buffer = new Uint8Array(analyser.fftSize);
     analyser.getByteTimeDomainData(buffer);
 
-    // 背景
-    wctx.fillStyle = '#ffffff';
-    wctx.fillRect(0, 0, waveCanvas.width, waveCanvas.height);
+    // 計算此次要繪的長度（高頻模式只畫 5 個封包）
+    let drawLen = buffer.length;
+    if (hiFreqMode.checked) {
+      drawLen = Math.min(buffer.length, PACKETS_TO_SHOW * SAMPLES_PER_PACKET); // 1280
+    }
+    const start = buffer.length - drawLen;
 
-    // 中心線
+    // 背景與中心線
+    wctx.fillStyle = DRAW_BG;
+    wctx.fillRect(0, 0, waveCanvas.width, waveCanvas.height);
     wctx.strokeStyle = '#e6e6e6';
     wctx.lineWidth = 1;
     wctx.beginPath();
@@ -139,28 +147,44 @@
     wctx.lineTo(waveCanvas.width, waveCanvas.height/2);
     wctx.stroke();
 
-    // 波形
+    // 波形（含振幅放大）
     wctx.strokeStyle = '#000000';
     wctx.lineWidth = 2;
     wctx.beginPath();
 
-    const slice = waveCanvas.width / buffer.length;
+    const slice = waveCanvas.width / drawLen;
     let x = 0;
-    for (let i = 0; i < buffer.length; i++) {
-      const v = buffer[i] / 128.0; // 0..255 -> around 1.0 at center
-      const y = (v * waveCanvas.height/2);
-      if (i === 0) wctx.moveTo(x, y);
+
+    for (let i = start; i < start + drawLen; i++) {
+      // 0..255 中心約 128，先中心化、再以 ampGain 放大
+      const centered = (buffer[i] - 128) / 128;    // -1..+1
+      const amplified = Math.max(-1, Math.min(1, centered * ampGain));
+      const y = waveCanvas.height/2 + amplified * (waveCanvas.height/2 - 2);
+
+      if (i === start) wctx.moveTo(x, y);
       else wctx.lineTo(x, y);
       x += slice;
     }
     wctx.stroke();
 
-    if (!drawFrozen) {
-      rafId = requestAnimationFrame(drawWaveform);
+    // 高頻模式下，用淡線標出 5 個封包的邊界（利於觀察）
+    if (hiFreqMode.checked) {
+      wctx.strokeStyle = '#cccccc';
+      wctx.lineWidth = 1;
+      const pxPerPacket = waveCanvas.width / PACKETS_TO_SHOW;
+      for (let k = 1; k < PACKETS_TO_SHOW; k++) {
+        const xline = Math.round(pxPerPacket * k) + 0.5;
+        wctx.beginPath();
+        wctx.moveTo(xline, 0);
+        wctx.lineTo(xline, waveCanvas.height);
+        wctx.stroke();
+      }
     }
+
+    if (!drawFrozen) { rafId = requestAnimationFrame(drawWaveform); }
   }
 
-  function smoothArray(arr, windowSize=3) {
+  function smoothArray(arr, windowSize=5) {
     const out = new Float32Array(arr.length);
     const half = Math.floor(windowSize/2);
     for (let i=0;i<arr.length;i++){
@@ -179,59 +203,35 @@
     const freqData = new Uint8Array(N);
     analyser.getByteFrequencyData(freqData);
 
-    // 轉 Float 並略做平滑，過濾雜訊
     const floatArr = Float32Array.from(freqData, v => v);
     const smoothed = smoothArray(floatArr, 5);
 
-    // 忽略 DC（0 Hz）與很高頻噪聲，可用範圍 20Hz ~ 8000Hz（語音常見主成分）
     const minHz = 20;
     const maxHz = Math.min(8000, sampleRate / 2);
     const binHz = sampleRate / FFT_SIZE;
 
-    let candidates = [];
     let totalAmp = 0;
-
+    const candidates = [];
     for (let i = 0; i < N; i++) {
       const hz = i * binHz;
       const amp = Math.max(0, smoothed[i]);
-      if (hz >= minHz && hz <= maxHz) {
-        candidates.push({ i, hz, amp });
-        totalAmp += amp;
-      }
+      if (hz >= minHz && hz <= maxHz) { candidates.push({i, hz, amp}); totalAmp += amp; }
     }
+    if (totalAmp <= 0) return { list: [], totalAmp: 0 };
 
-    if (totalAmp <= 0) {
-      return { list: [], totalAmp: 0 };
-    }
-
-    // 找「局部峰值」
     const peaks = [];
     for (let k = 1; k < candidates.length - 1; k++) {
       const a = candidates[k-1].amp, b = candidates[k].amp, c = candidates[k+1].amp;
-      if (b > a && b >= c) {
-        peaks.push(candidates[k]);
-      }
+      if (b > a && b >= c) peaks.push(candidates[k]);
     }
-
-    // 依強度排序
     peaks.sort((p, q) => q.amp - p.amp);
 
-    // 合併彼此太接近的峰（避免同一主頻被多個相鄰 bin 吃到）
     const merged = [];
-    const minSepHz = binHz * 3; // 至少間隔幾個 bin
-    peaks.forEach(p => {
-      if (!merged.some(m => Math.abs(m.hz - p.hz) < minSepHz)) merged.push(p);
-    });
+    const minSepHz = binHz * 3;
+    peaks.forEach(p => { if (!merged.some(m => Math.abs(m.hz - p.hz) < minSepHz)) merged.push(p); });
 
-    // 取前 topN
     const top = merged.slice(0, topN);
-
-    // 佔比（相對於總能量）
-    const list = top.map(item => ({
-      hz: item.hz,
-      ratio: (item.amp / totalAmp)
-    }));
-
+    const list = top.map(item => ({ hz: item.hz, ratio: (item.amp / totalAmp) }));
     return { list, totalAmp };
   }
 
@@ -255,16 +255,22 @@
     try {
       mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (err) {
-      setStatus('無法取得麥克風權限：' + err.message);
+      const msg =
+        err.name === 'NotAllowedError' || err.message?.includes('Permission denied') ?
+          '瀏覽器拒絕麥克風授權：\n1) 若本頁面嵌在 Google Sites 內，請「在新視窗開啟」。\n2) 網址列鎖頭→網站設定→麥克風→允許。\n3) 檢查作業系統是否允許瀏覽器使用麥克風。' :
+        err.name === 'NotFoundError' ?
+          '找不到麥克風，請確認裝置與系統設定。' :
+          '啟用麥克風時發生錯誤：' + err.message;
+      setStatus(msg);
       return;
     }
 
-    // Audio Graph
+    // 建立音訊串接
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     mediaSource = audioCtx.createMediaStreamSource(mediaStream);
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = FFT_SIZE;
-    analyser.smoothingTimeConstant = 0.85; // 稍微平滑
+    analyser.smoothingTimeConstant = 0.85;
 
     mediaSource.connect(analyser);
 
@@ -273,51 +279,41 @@
     drawingStarted = true;
     rafId = requestAnimationFrame(drawWaveform);
 
-    // 即時主頻更新
+    // 主頻更新
     updateFreqReadout();
     freqTimer = setInterval(updateFreqReadout, FREQ_UPDATE_MS);
 
-    // MediaRecorder（如需實際保存錄音，可在 onstop 取得 blob）
+    // 以 2 秒為 timeslice，10 秒 = 5 個封包
     if (window.MediaRecorder) {
       mediaRecorder = new MediaRecorder(mediaStream);
       const chunks = [];
       mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
       mediaRecorder.onstop = () => {
-        // 你可選擇提供下載：
+        // 若要下載錄音，可在這裡組合 blob：
         // const blob = new Blob(chunks, { type: 'audio/webm' });
         // const url = URL.createObjectURL(blob);
-        // setStatus('已錄製 10 秒。'); // 或顯示下載連結
+        // 下載連結略
       };
-      mediaRecorder.start();
+      mediaRecorder.start(2000); // <= 每 2000ms 產生一個封包（共 5 包）
     }
 
-    // UI 狀態
     btnPause.disabled = false;
     btnPause.textContent = '⏸ 暫停波形';
-    setStatus('錄音中…（自動於 10 秒結束）');
+    setStatus('錄音中…（自動於 10 秒結束；2 秒一包，共 5 包）');
 
-    // 10 秒後自動停止
+    // 10 秒後自動停止（並保持最後一幀＝凍結）
     recordTimer = setTimeout(() => {
-      // 停止圖與頻率更新，但保留最後一幀＝「凍結」
       drawFrozen = true;
-      if (rafId) cancelAnimationFrame(rafId);
-      rafId = null;
-      if (freqTimer) clearInterval(freqTimer);
-      freqTimer = null;
+      if (rafId) cancelAnimationFrame(rafId); rafId = null;
+      if (freqTimer) clearInterval(freqTimer); freqTimer = null;
 
-      // 停止錄音、關閉串流
-      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        try { mediaRecorder.stop(); } catch {}
-      }
-      if (mediaStream) {
-        mediaStream.getTracks().forEach(t => t.stop());
-        mediaStream = null;
-      }
-      setStatus('已自動結束錄音（10 秒）。');
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') { try { mediaRecorder.stop(); } catch {} }
+      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+      setStatus('已自動結束錄音（10 秒，5 個封包）。');
     }, 10000);
   }
 
-  // --- 事件繫結 ---
+  // --- 事件 ---
   btnStart.addEventListener('click', startRecording10s);
 
   btnPause.addEventListener('click', () => {
@@ -330,10 +326,8 @@
       setStatus('持續更新中…');
     } else {
       btnPause.textContent = '▶️ 繼續波形';
-      if (rafId) cancelAnimationFrame(rafId);
-      rafId = null;
-      if (freqTimer) clearInterval(freqTimer);
-      freqTimer = null;
+      if (rafId) cancelAnimationFrame(rafId); rafId = null;
+      if (freqTimer) clearInterval(freqTimer); freqTimer = null;
       setStatus('已凍結波形。');
     }
   });
@@ -343,6 +337,11 @@
     clearScreen();
     setStatus('已清除畫面。');
     freqReadout.textContent = '';
+  });
+
+  gainSlider.addEventListener('input', () => {
+    ampGain = parseFloat(gainSlider.value);
+    gainVal.textContent = ampGain.toFixed(1) + '×';
   });
 })();
 </script>

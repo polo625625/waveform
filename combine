@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>高解析度合成波形圖</title>
+  <style>
+    .input-container {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
+    }
+    .column {
+      flex: 1;
+      min-width: 300px;
+    }
+    .inputSet {
+      margin-bottom: 10px;
+    }
+    .controls {
+      margin-bottom: 10px;
+    }
+    .volumeControl {
+      margin-top: 20px;
+    }
+    .canvas-container {
+      position: relative;
+    }
+  </style>
+</head>
+<body>
+  <div class="input-container">
+    <!-- 頻率與振幅輸入 -->
+    <div class="column">
+      <div class="inputSet">
+        <label>頻率1（Hz）：</label>
+        <input type="number" id="frequencyInput1" min="20" max="20000" step="1" value="440">
+        <label>振幅1：</label>
+        <input type="number" id="amplitudeInput1" min="0" max="1" step="0.02" value="0.5">
+      </div>
+      <div class="inputSet">
+        <label>頻率2（Hz）：</label>
+        <input type="number" id="frequencyInput2" min="20" max="20000" step="1" value="880">
+        <label>振幅2：</label>
+        <input type="number" id="amplitudeInput2" min="0" max="1" step="0.02" value="0.3">
+      </div>
+      <div class="inputSet">
+        <label>頻率3（Hz）：</label>
+        <input type="number" id="frequencyInput3" min="20" max="20000" step="1" value="1760">
+        <label>振幅3：</label>
+        <input type="number" id="amplitudeInput3" min="0" max="1" step="0.02" value="0.2">
+      </div>
+    </div>
+    <div class="column">
+      <div class="inputSet">
+        <label>頻率4（Hz）：</label>
+        <input type="number" id="frequencyInput4" min="20" max="20000" step="1" value="220">
+        <label>振幅4：</label>
+        <input type="number" id="amplitudeInput4" min="0" max="1" step="0.02" value="0.4">
+      </div>
+      <div class="inputSet">
+        <label>頻率5（Hz）：</label>
+        <input type="number" id="frequencyInput5" min="20" max="20000" step="1" value="110">
+        <label>振幅5：</label>
+        <input type="number" id="amplitudeInput5" min="0" max="1" step="0.02" value="0.3">
+      </div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button onclick="playSyntheticWave()">播放合成波</button>
+    <button onclick="stopAllOscillators()">停止播放</button>
+    <button onclick="zoomIn()">每秒間格縮小</button>
+    <button onclick="zoomOut()">每秒間格放大</button>
+    <!-- 新增存檔按鍵 -->
+    <button onclick="saveMP4()">存成 MP4</button>
+    <div class="volumeControl">
+      <label>音量：</label>
+      <input type="range" id="volumeControl" min="0" max="1" step="0.01" value="1" oninput="changeVolume()">
+    </div>
+  </div>
+
+  <div class="canvas-container">
+    <canvas id="waveformCanvas" width="1000" height="400"></canvas>
+  </div>
+
+  <!-- 新增錄製完成後顯示影片的容器 -->
+  <div id="recordedVideoContainer"></div>
+
+  <script>
+    // 建立 AudioContext 與 GainNode
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    let timeScale = 1;
+    let oscillators = [];
+    const gainNode = audioContext.createGain();
+    gainNode.connect(audioContext.destination);
+    // 為錄製音訊額外建立 MediaStreamDestination 並接到 gainNode
+    const audioDestination = audioContext.createMediaStreamDestination();
+    gainNode.connect(audioDestination);
+
+    function stopAllOscillators() {
+      oscillators.forEach(osc => osc.stop());
+      oscillators = [];
+    }
+
+    function playSyntheticWave() {
+      if (audioContext.state === 'suspended') {
+        audioContext.resume();
+      }
+      stopAllOscillators();
+      redrawWaveform();
+      for (let i = 1; i <= 5; i++) {
+        const frequency = parseFloat(document.getElementById('frequencyInput' + i).value);
+        const amplitude = parseFloat(document.getElementById('amplitudeInput' + i).value);
+        if (!isNaN(frequency) && !isNaN(amplitude) && frequency > 0 && amplitude > 0) {
+          const osc = audioContext.createOscillator();
+          const gain = audioContext.createGain();
+          osc.type = 'sine';
+          osc.frequency.value = frequency;
+          gain.gain.value = amplitude;
+          osc.connect(gain);
+          gain.connect(gainNode);
+          osc.start();
+          oscillators.push(osc);
+        }
+      }
+    }
+
+    function drawTimeAxis(context, width, height) {
+      context.strokeStyle = 'black';
+      context.lineWidth = 1;
+      context.beginPath();
+      context.moveTo(0, height / 2);
+      context.lineTo(width, height / 2);
+      context.stroke();
+      context.font = "18px Arial";
+      context.fillStyle = "black";
+      const timeInterval = 1 / timeScale;
+      const step = width / 10;
+      for (let i = 0; i <= 10; i++) {
+        const x = i * step;
+        context.fillText((i * timeInterval).toFixed(2) + 's', x, height / 2 + 30);
+      }
+    }
+
+    function redrawWaveform() {
+      const canvas = document.getElementById('waveformCanvas');
+      const context = canvas.getContext('2d');
+      const width = canvas.width;
+      const height = canvas.height;
+      const samples = 10000;
+      const step = (width / samples) * timeScale;
+
+      context.clearRect(0, 0, width, height);
+      context.strokeStyle = 'blue';
+      context.lineWidth = 2;
+      context.beginPath();
+
+      let totalAmplitude = new Array(samples).fill(0);
+      for (let i = 1; i <= 5; i++) {
+        const frequency = parseFloat(document.getElementById('frequencyInput' + i).value);
+        const amplitude = parseFloat(document.getElementById('amplitudeInput' + i).value);
+        if (!isNaN(frequency) && !isNaN(amplitude)) {
+          for (let j = 0; j < samples; j++) {
+            totalAmplitude[j] += amplitude * Math.sin(2 * Math.PI * frequency * j / samples);
+          }
+        }
+      }
+
+      for (let j = 0; j < samples; j++) {
+        const x = j * step;
+        const y = height / 2 - totalAmplitude[j] * height / 4;
+        context.lineTo(x, y);
+      }
+
+      context.stroke();
+      drawTimeAxis(context, width, height);
+    }
+
+    function zoomIn() {
+      timeScale *= 2;
+      redrawWaveform();
+    }
+
+    function zoomOut() {
+      timeScale /= 2;
+      redrawWaveform();
+    }
+
+    function changeVolume() {
+      gainNode.gain.value = document.getElementById('volumeControl').value;
+    }
+    
+    // 新增：存成 MP4 檔的功能
+    function saveMP4() {
+      const canvas = document.getElementById('waveformCanvas');
+      // 以 30 fps 擷取 canvas 畫面
+      const canvasStream = canvas.captureStream(30);
+      // 將 canvas 的 video 軌與 audioDestination 中的音訊軌合併
+      const combinedStream = new MediaStream([
+        ...canvasStream.getVideoTracks(),
+        ...audioDestination.stream.getAudioTracks()
+      ]);
+      
+      // 嘗試指定 mimeType 為 video/mp4，若不支援則改用 video/webm
+      let options = { mimeType: "video/mp4" };
+      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+        options = { mimeType: "video/webm" };
+      }
+      
+      let recordedChunks = [];
+      const mediaRecorder = new MediaRecorder(combinedStream, options);
+      
+      mediaRecorder.ondataavailable = function(e) {
+        if (e.data && e.data.size > 0) {
+          recordedChunks.push(e.data);
+        }
+      };
+      
+      mediaRecorder.onstop = function() {
+        const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType });
+        const url = URL.createObjectURL(blob);
+        
+        // 建立影片元件以播放錄製結果
+        const videoElement = document.createElement("video");
+        videoElement.controls = true;
+        videoElement.src = url;
+        videoElement.width = 1000;
+        videoElement.height = 400;
+        
+        // 建立下載連結
+        const downloadLink = document.createElement("a");
+        downloadLink.href = url;
+        const extension = mediaRecorder.mimeType === "video/mp4" ? "mp4" : "webm";
+        downloadLink.download = "custom_ringtone." + extension;
+        downloadLink.innerText = "下載 MP4 檔案";
+        
+        // 將影片、下載連結與訊息顯示於畫面上
+        const container = document.getElementById("recordedVideoContainer");
+        container.innerHTML = "";
+        container.appendChild(videoElement);
+        container.appendChild(document.createElement("br"));
+        container.appendChild(downloadLink);
+        
+        const message = document.createElement("p");
+        message.innerText = "恭喜您擁有自創鈴聲";
+        container.appendChild(message);
+      };
+      
+      mediaRecorder.start();
+      // 錄製 5 秒後自動停止錄製
+      setTimeout(function() {
+        mediaRecorder.stop();
+      }, 5000);
+    }
+  </script>
+</body>
+</html>
